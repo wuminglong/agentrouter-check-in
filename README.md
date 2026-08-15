@@ -12,18 +12,11 @@ AgentRouter 本地自动签到脚本。
 
 ## 安装
 
-克隆项目并安装依赖：
-
 ```bash
 git clone https://github.com/wuminglong/agentrouter-check-in.git
 cd agentrouter-check-in
 uv sync
 uv run python -m cloakbrowser install
-```
-
-创建本地配置：
-
-```bash
 cp .env.example .env
 ```
 
@@ -32,7 +25,6 @@ cp .env.example .env
 ```dotenv
 AGENTROUTER_ACCOUNTS=["account1","account2"]
 CHECKIN_PROXY_URL=http://127.0.0.1:7890
-CHECKIN_HEADLESS=false
 ```
 
 `account1`、`account2` 是本地 Profile 名称，可自行定义。
@@ -43,26 +35,22 @@ CHECKIN_HEADLESS=false
 CHECKIN_PROXY_URL=
 ```
 
-为保持 GitHub OAuth 登录环境一致，当前签到固定使用有界面浏览器模式。
+为保持 GitHub OAuth 登录环境一致，签到与首次登录均固定使用有界面浏览器模式。
 
 ## 添加账号
 
-首次使用时，需要为每个账号保存一次 GitHub 登录态：
-
-```bash
-uv run python checkin.py add account1
-```
-
-浏览器打开后，完成对应 GitHub 账号的登录和验证。
-
-添加多个账号时分别执行：
+首次使用时，为每个账号保存一次 GitHub 登录态：
 
 ```bash
 uv run python checkin.py add account1
 uv run python checkin.py add account2
 ```
 
-查看已配置账号：
+浏览器打开后，完成对应 GitHub 账号的登录和验证。
+
+如果 GitHub 登录态以后失效，重新执行同一个 `add` 命令即可。脚本会复用已有 Profile，不会主动删除原浏览器身份。
+
+查看本地 Profile 状态：
 
 ```bash
 uv run python checkin.py list
@@ -71,13 +59,13 @@ uv run python checkin.py list
 示例：
 
 ```text
-✅ account1: valid
-✅ account2: valid
+✅ account1: configured (.browser_profiles/agentrouter/account1)
+❌ account2: github-session-expired (.browser_profiles/agentrouter/account2)
 ```
 
-## 执行签到
+`configured` 表示本地 Profile 已配置，不代表此命令实时访问 GitHub 验证会话。
 
-执行所有已配置账号：
+## 执行签到
 
 ```bash
 uv run python checkin.py
@@ -98,18 +86,13 @@ uv run python checkin.py
 [STATS] 成功 2/2
 ```
 
-## 重新登录
-
-如果 GitHub 登录态失效，重新执行：
-
-```bash
-uv run python checkin.py add <name>
-```
-
 ## 删除账号
+
+如果需要彻底重建某个 Profile：
 
 ```bash
 uv run python checkin.py delete <name>
+uv run python checkin.py add <name>
 ```
 
 ## 本地文件
