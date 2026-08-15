@@ -433,6 +433,31 @@ async def _wait_new_session(previous: str | None, context, timeout_ms: int = 45_
     return False
 
 
+async def _wait_oauth_user_context(page, timeout_ms: int = 10_000) -> bool:
+    """Wait for the OAuth callback SPA to persist the returned user object."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if page is None or page.is_closed():
+            return False
+        try:
+            user_id = await page.evaluate(
+                """() => {
+                    try {
+                        const user = JSON.parse(localStorage.getItem('user') || '{}');
+                        return user?.id ?? null;
+                    } catch (_) {
+                        return null;
+                    }
+                }"""
+            )
+            if user_id is not None:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+    return False
+
+
 def _oauth_callback_completed(oauth_page, provider_page) -> bool:
     if oauth_page is None:
         return PROVIDER_DOMAIN in provider_page.url and "/login" not in provider_page.url
@@ -460,21 +485,31 @@ async def _capture_user_profile_from_console(page, timeout_ms: int = 15_000) -> 
     """
     captured: dict | None = None
     captured_event = asyncio.Event()
+    observed_statuses: list[int] = []
+    response_errors: list[str] = []
 
     async def on_response(response) -> None:
         nonlocal captured
         if captured is not None:
             return
-        if USER_SELF_PATH not in response.url or response.status != 200:
+        if USER_SELF_PATH not in response.url:
+            return
+        observed_statuses.append(response.status)
+        if response.status != 200:
+            response_errors.append(f"HTTP {response.status}")
             return
         try:
             payload = await response.json()
-        except Exception:
+        except Exception as exc:
+            response_errors.append(f"响应内容不可读取: {exc}")
             return
         profile = _extract_user_profile(payload)
         if profile:
             captured = profile
             captured_event.set()
+        else:
+            keys = sorted(str(key) for key in payload) if isinstance(payload, dict) else []
+            response_errors.append(f"响应结构无法识别，顶层字段: {keys}")
 
     page.on("response", on_response)
     try:
@@ -484,8 +519,8 @@ async def _capture_user_profile_from_console(page, timeout_ms: int = 15_000) -> 
                 wait_until="domcontentloaded",
                 timeout=60_000,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[WARN] 打开 AgentRouter 控制台失败: {exc}")
 
         try:
             await page.wait_for_load_state("networkidle", timeout=10_000)
@@ -500,6 +535,10 @@ async def _capture_user_profile_from_console(page, timeout_ms: int = 15_000) -> 
 
         if captured is not None:
             print("[INFO] 已监听页面原生 /api/user/self 响应并读取余额")
+        elif not observed_statuses:
+            print("[WARN] AgentRouter 控制台未发出 /api/user/self 请求")
+        elif response_errors:
+            print(f"[WARN] 页面原生 /api/user/self 未能读取余额: {response_errors[-1]}")
         return captured
     finally:
         page.remove_listener("response", on_response)
@@ -693,6 +732,12 @@ async def check_in(name: str) -> dict:
             print(f"[{name}] [WARN] 未明确观察到 OAuth 回调页面")
 
         oauth_verified = new_session
+        callback_page = oauth_page if oauth_page is not None and not oauth_page.is_closed() else page
+        if new_session:
+            if await _wait_oauth_user_context(callback_page):
+                print(f"[{name}] [INFO] OAuth 用户上下文已就绪")
+            else:
+                print(f"[{name}] [WARN] OAuth 用户上下文未在预期时间内就绪")
 
         user_profile = await _fetch_user_profile(page)
         balance = _balance(user_profile)

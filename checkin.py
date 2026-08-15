@@ -61,62 +61,25 @@ async def _clear_agentrouter_auth(context, page, name: str) -> None:
         print(f"[WARN] {name}: AgentRouter storage 清理失败: {exc}")
 
 
-async def _read_local_user_id(page) -> str | None:
-    """Read AgentRouter user id after the SPA has initialized localStorage."""
-    try:
-        value = await page.evaluate(
-            """() => {
-                try {
-                    const user = JSON.parse(localStorage.getItem('user') || '{}');
-                    const id = user?.id;
-                    return id === null || id === undefined ? null : String(id);
-                } catch (_) {
-                    return null;
-                }
-            }"""
-        )
-    except Exception:
-        return None
-
-    if value is None:
-        return None
-    value = str(value).strip()
-    return value or None
-
-
-async def _wait_local_user_id(page, timeout_seconds: float = 6.0) -> str | None:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        user_id = await _read_local_user_id(page)
-        if user_id:
-            return user_id
-        await asyncio.sleep(0.5)
-    return None
-
-
 async def _fetch_user_profile(page) -> dict | None:
     """Read balance after OAuth, tolerating AgentRouter SPA initialization races."""
     profile = await _original_capture_user_profile(page, timeout_ms=15_000)
     if profile:
         return profile
 
-    print("[WARN] 未捕获页面原生 /api/user/self 响应，等待用户上下文后主动查询")
+    print("[WARN] 未从页面原生 /api/user/self 响应读取余额，改用主动查询")
 
     for attempt in range(1, 5):
-        user_id = await _wait_local_user_id(page)
-        if user_id:
-            profile = await _original_fetch_user_profile_direct(page)
-            if profile:
-                return profile
-        else:
-            print(f"[WARN] AgentRouter user_id 尚未就绪（第 {attempt}/4 次）")
+        profile = await _original_fetch_user_profile_direct(page)
+        if profile:
+            return profile
 
         if attempt < 4:
             print(f"[INFO] 余额查询重试 {attempt}/3")
             try:
                 await page.reload(wait_until="domcontentloaded", timeout=30_000)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[WARN] 余额查询页面刷新失败: {exc}")
             await asyncio.sleep(1)
 
     return None
