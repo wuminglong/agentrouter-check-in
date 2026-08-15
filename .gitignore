@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# GitHub 浏览器登录态：绝对不能提交
+.browser_profiles/
+
+# 本地余额历史
+agentrouter_local_state.json
