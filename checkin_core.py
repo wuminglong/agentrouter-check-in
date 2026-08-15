@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import shutil
 import sys
 import time
@@ -99,6 +100,33 @@ def _write_marker(name: str, status: str) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _ensure_fingerprint_seed(name: str) -> str:
+    """为每个 Profile 生成并持久化固定浏览器指纹。
+
+    CloakBrowser 在未指定 fingerprint seed 时，每次启动会生成新的浏览器身份。
+    GitHub 会将这类变化视为设备环境变化，因此同一个 Profile 必须始终复用同一个 seed。
+    """
+    path = _marker_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = _read_marker(name)
+
+    seed = data.get("fingerprint_seed")
+    if isinstance(seed, str) and seed.strip():
+        return seed.strip()
+
+    seed = secrets.token_hex(16)
+    data.update(
+        {
+            "profile": name,
+            "fingerprint_seed": seed,
+            "status": str(data.get("status") or "initializing"),
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return seed
+
+
 def _profile_status(name: str) -> str:
     return str(_read_marker(name).get("status") or "missing")
 
@@ -156,11 +184,15 @@ async def _launch_context(name: str, *, headless: bool):
 
     profile = _profile_dir(name)
     profile.mkdir(parents=True, exist_ok=True)
+    fingerprint_seed = _ensure_fingerprint_seed(name)
+
+    print(f"[INFO] Browser profile: {profile.resolve()}")
 
     kwargs = {
         "headless": headless,
         "humanize": HUMANIZE,
         "viewport": {"width": 1920, "height": 1080},
+        "args": [f"--fingerprint={fingerprint_seed}"],
     }
     if HUMANIZE:
         kwargs["human_preset"] = "careful"
