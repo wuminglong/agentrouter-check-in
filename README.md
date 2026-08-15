@@ -32,7 +32,7 @@ cp .env.example .env
 ```dotenv
 AGENTROUTER_ACCOUNTS=["account1","account2"]
 CHECKIN_PROXY_URL=http://127.0.0.1:7890
-CHECKIN_HEADLESS=true
+CHECKIN_HEADLESS=false
 ```
 
 `account1`、`account2` 是本地 Profile 名称，可自行定义。
@@ -42,6 +42,8 @@ CHECKIN_HEADLESS=true
 ```dotenv
 CHECKIN_PROXY_URL=
 ```
+
+为保持 GitHub OAuth 登录环境一致，当前签到固定使用有界面浏览器模式。
 
 ## 添加账号
 
