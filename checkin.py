@@ -19,22 +19,24 @@ os.chdir(BASE_DIR)
 # Keep daily OAuth runs in the same browser mode as the interactive `add` flow.
 os.environ["CHECKIN_HEADLESS"] = "false"
 
-# Load the core without executing main so a couple of runtime behaviors can be
-# patched without duplicating the OAuth/check-in implementation.
+# Load the core without executing main. Note that runpy.run_path() returns a
+# dictionary that is NOT the same object as function.__globals__, so patches must
+# be written into the actual globals used by check_in().
 core = runpy.run_path(str(BASE_DIR / "checkin_core.py"), run_name="agentrouter_core")
+core_globals = core["check_in"].__globals__
 
-_original_capture_user_profile = core["_capture_user_profile_from_console"]
-_original_fetch_user_profile_direct = core["_fetch_user_profile_direct"]
+_original_capture_user_profile = core_globals["_capture_user_profile_from_console"]
+_original_fetch_user_profile_direct = core_globals["_fetch_user_profile_direct"]
 
 
 async def _clear_agentrouter_auth(context, page, name: str) -> None:
     """Clear AgentRouter auth once before login while preserving GitHub state.
 
-    The old implementation used add_init_script(), which ran on every later
-    AgentRouter navigation and could delete localStorage.user again after OAuth.
-    That made /api/user/self intermittently fail because New-Api-User was lost.
+    The original implementation used add_init_script(), which ran again on later
+    AgentRouter navigations and could remove localStorage.user after OAuth. That
+    made /api/user/self intermittently fail with user_id=None.
     """
-    provider_domain = core["PROVIDER_DOMAIN"]
+    provider_domain = core_globals["PROVIDER_DOMAIN"]
     hostname = urlparse(provider_domain).hostname
     if not hostname:
         raise RuntimeError(f"无法解析 AgentRouter 域名: {provider_domain}")
@@ -89,7 +91,8 @@ async def _fetch_user_profile(page) -> dict | None:
     return None
 
 
-core["_clear_agentrouter_auth"] = _clear_agentrouter_auth
-core["_fetch_user_profile"] = _fetch_user_profile
+# Patch the ACTUAL globals used by check_in().
+core_globals["_clear_agentrouter_auth"] = _clear_agentrouter_auth
+core_globals["_fetch_user_profile"] = _fetch_user_profile
 
 raise SystemExit(core["main"]())
