@@ -26,6 +26,7 @@ import shutil
 import sys
 import time
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
@@ -33,16 +34,30 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# All default relative paths are anchored to this file, not to the process CWD,
+# so `python checkin_core.py` from any directory touches the same profiles.
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else BASE_DIR / path
+
+
 PROVIDER_DOMAIN = os.getenv("AGENTROUTER_DOMAIN", "https://agentrouter.org").rstrip("/")
+PROVIDER_HOST = urlparse(PROVIDER_DOMAIN).hostname or ""
 LOGIN_PATH = "/login"
 CONSOLE_PATH = "/console"
 USER_SELF_PATH = "/api/user/self"
 
 GITHUB_PROFILE_URL = "https://github.com/settings/profile"
 
+# AgentRouter reports quota in internal units; 500000 units == $1.
+QUOTA_UNITS_PER_DOLLAR = 500_000
+
 PROFILE_MARKER = ".agentrouter-github-profile.json"
-PROFILE_ROOT = Path(os.getenv("CHECKIN_BROWSER_PROFILE_DIR", ".browser_profiles")) / "agentrouter"
-STATE_FILE = Path(os.getenv("AGENTROUTER_LOCAL_STATE_FILE", "agentrouter_local_state.json"))
+PROFILE_ROOT = _resolve_path(os.getenv("CHECKIN_BROWSER_PROFILE_DIR", ".browser_profiles")) / "agentrouter"
+STATE_FILE = _resolve_path(os.getenv("AGENTROUTER_LOCAL_STATE_FILE", "agentrouter_local_state.json"))
 
 WAIT_TIMEOUT_MS = int(os.getenv("CHECKIN_WAIT_TIMEOUT_MS", "120000"))
 HEADLESS = os.getenv("CHECKIN_HEADLESS", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -63,9 +78,25 @@ GITHUB_LOGIN_SELECTORS = (
 
 
 def _validate_name(name: str) -> str:
+    """Validate a profile name that will be used as a directory name.
+
+    The character class alone is not enough: "." and ".." match it and would
+    escape PROFILE_ROOT, which makes `delete <name>` wipe every profile.
+
+    The containment check is purely lexical (normpath, no resolve) so that it
+    neither touches the filesystem nor rejects a profile directory the user has
+    deliberately symlinked elsewhere.
+    """
     name = name.strip()
     if not name or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
         raise ValueError("账号名称只能包含字母、数字、点、下划线和短横线")
+    if name in {".", ".."}:
+        raise ValueError(f"账号名称不能是 {name!r}（保留的目录名）")
+
+    root = os.path.normpath(str(PROFILE_ROOT))
+    candidate = os.path.normpath(os.path.join(root, name))
+    if candidate == root or os.path.dirname(candidate) != root:
+        raise ValueError(f"账号名称非法，会逃逸出 profile 目录: {name!r}")
     return name
 
 
@@ -77,20 +108,47 @@ def _marker_path(name: str) -> Path:
     return _profile_dir(name) / PROFILE_MARKER
 
 
-def _read_marker(name: str) -> dict:
-    path = _marker_path(name)
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Write JSON via a temp file + os.replace.
+
+    A truncated marker loses fingerprint_seed, which silently changes the
+    browser identity GitHub sees. Never leave a half-written file behind.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _read_json_file(path: Path) -> dict:
+    """Read a JSON dict, quarantining corrupt files instead of silently losing them."""
     if not path.exists():
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
+    except Exception as exc:
+        backup = path.with_name(f"{path.name}.corrupt")
+        try:
+            os.replace(path, backup)
+            print(f"[WARN] {path.name} 解析失败（{exc}），已备份为 {backup.name}")
+        except OSError:
+            print(f"[WARN] {path.name} 解析失败: {exc}")
         return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_marker(name: str) -> dict:
+    return _read_json_file(_marker_path(name))
 
 
 def _write_marker(name: str, status: str) -> None:
-    path = _marker_path(name)
-    path.parent.mkdir(parents=True, exist_ok=True)
     data = _read_marker(name)
     data.update(
         {
@@ -99,24 +157,62 @@ def _write_marker(name: str, status: str) -> None:
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
     )
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_json(_marker_path(name), data)
 
 
-def _ensure_fingerprint_seed(name: str) -> str:
-    """为每个 Profile 生成并持久化固定浏览器指纹。
+def _coerce_fingerprint_seed(value: object) -> int | None:
+    """Normalize a stored seed to the integer form the patched Chromium expects.
+
+    cloakbrowser documents `--fingerprint=12345` and its own default is
+    `random.randint(10000, 99999)`. Earlier versions of this script stored a
+    32-char hex string, which the binary does not parse as a seed. Fold any
+    legacy hex value down deterministically so a given profile keeps a stable
+    identity instead of getting a fresh random one.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 10_000 <= value <= 99_999 else None
+
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        number = int(text)
+        return number if 10_000 <= number <= 99_999 else None
+
+    try:
+        int(text, 16)
+    except ValueError:
+        return None
+    # Deterministic legacy-hex -> numeric-seed migration.
+    digest = sha256(text.encode("utf-8")).digest()
+    return 10_000 + int.from_bytes(digest[:8], "big") % 90_000
+
+
+def _ensure_fingerprint_seed(name: str) -> int:
+    """为每个 Profile 生成并持久化固定浏览器指纹 seed。
 
     CloakBrowser 在未指定 fingerprint seed 时，每次启动会生成新的浏览器身份。
     GitHub 会将这类变化视为设备环境变化，因此同一个 Profile 必须始终复用同一个 seed。
+    seed 必须是 cloakbrowser/补丁 Chromium 能解析的数字（见 _coerce_fingerprint_seed）。
     """
-    path = _marker_path(name)
-    path.parent.mkdir(parents=True, exist_ok=True)
     data = _read_marker(name)
+    stored = data.get("fingerprint_seed")
+    seed = _coerce_fingerprint_seed(stored)
 
-    seed = data.get("fingerprint_seed")
-    if isinstance(seed, str) and seed.strip():
-        return seed.strip()
+    if seed is not None and seed == stored:
+        return seed
 
-    seed = secrets.token_hex(16)
+    if seed is None:
+        seed = 10_000 + secrets.randbelow(90_000)
+        if stored is not None:
+            print(f"[WARN] {name}: fingerprint seed 无法识别，已重新生成（浏览器指纹会变化）")
+    else:
+        print(f"[INFO] {name}: 已将旧版 fingerprint seed 迁移为数字 {seed}")
+
     data.update(
         {
             "profile": name,
@@ -125,7 +221,7 @@ def _ensure_fingerprint_seed(name: str) -> str:
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
     )
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_json(_marker_path(name), data)
     return seed
 
 
@@ -158,27 +254,26 @@ def _load_account_names() -> list[str]:
 
     if not PROFILE_ROOT.exists():
         return []
-    return sorted(
-        p.name for p in PROFILE_ROOT.iterdir()
-        if p.is_dir() and _marker_path(p.name).exists()
-    )
+
+    discovered: list[str] = []
+    for path in PROFILE_ROOT.iterdir():
+        if not path.is_dir():
+            continue
+        try:
+            candidate = _validate_name(path.name)
+        except ValueError:
+            continue
+        if _marker_path(candidate).exists():
+            discovered.append(candidate)
+    return sorted(discovered)
 
 
 def _load_state() -> dict:
-    if not STATE_FILE.exists():
-        return {}
-    try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    return _read_json_file(STATE_FILE)
 
 
 def _save_state(state: dict) -> None:
-    STATE_FILE.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    _atomic_write_json(STATE_FILE, state)
 
 
 async def _launch_context(name: str, *, headless: bool):
@@ -190,10 +285,12 @@ async def _launch_context(name: str, *, headless: bool):
 
     print(f"[INFO] Browser profile: {profile.resolve()}")
 
+    # Do not pass an explicit viewport: cloakbrowser's DEFAULT_VIEWPORT (1920x947)
+    # is deliberately screen height minus taskbar and Chrome UI. Forcing 1920x1080
+    # makes window.innerHeight == screen.height, which is an automation tell.
     kwargs = {
         "headless": headless,
         "humanize": HUMANIZE,
-        "viewport": {"width": 1920, "height": 1080},
         "args": [f"--fingerprint={fingerprint_seed}"],
     }
     if HUMANIZE:
@@ -205,16 +302,35 @@ async def _launch_context(name: str, *, headless: bool):
     return await launch_persistent_context_async(str(profile), **kwargs)
 
 
+def _cookie_matches_host(cookie: dict, host: str) -> bool:
+    """True when a cookie belongs to `host` or one of its parent domains."""
+    domain = str(cookie.get("domain") or "").lstrip(".").lower()
+    if not domain:
+        return False
+    host = host.lower()
+    return host == domain or host.endswith(f".{domain}")
+
+
+async def _cookies_for(context, url: str, host: str) -> list[dict]:
+    """Fetch cookies for `url`, falling back to a domain-filtered full dump.
+
+    The fallback must stay domain-scoped: matching a bare cookie name across the
+    whole jar can pick up an unrelated site's `session` / `user_session`.
+    """
+    try:
+        return list(await context.cookies(url))
+    except Exception:
+        cookies = await context.cookies()
+    return [c for c in cookies if _cookie_matches_host(c, host)]
+
+
 async def _github_logged_in(context) -> bool:
     """Return True only when a real GitHub session cookie is present.
 
     `logged_in=yes` alone is treated as insufficient because it can linger after
     a session is no longer accepted for OAuth.
     """
-    try:
-        cookies = await context.cookies("https://github.com")
-    except Exception:
-        cookies = await context.cookies()
+    cookies = await _cookies_for(context, "https://github.com", "github.com")
     by_name = {c.get("name"): c.get("value") for c in cookies}
     user_session = by_name.get("user_session")
     return bool(isinstance(user_session, str) and user_session.strip())
@@ -272,27 +388,52 @@ async def _looks_like_password_login(page) -> bool:
 
 
 async def _wait_github_auth_settled(page, timeout_ms: int = 15_000) -> str:
-    """Wait for GitHub redirects after OAuth entry, then return the settled kind."""
+    """Wait for GitHub redirects after OAuth entry, then return the settled kind.
+
+    A freshly opened popup sits on about:blank and a mid-flight tab can briefly
+    be on AgentRouter, both of which classify as "other". Returning immediately
+    on "other" means the gate check never observes the real destination, so keep
+    polling until we see a decisive kind, the page leaves GitHub for good, or we
+    run out of time.
+    """
     if page is None or page.is_closed():
         return "other"
 
     deadline = time.monotonic() + timeout_ms / 1000
+    # A popup starts on about:blank. Give it a bounded window to navigate before
+    # concluding anything; a page that has already navigated is classified at once,
+    # so the success path costs nothing extra.
+    blank_deadline = time.monotonic() + min(5.0, timeout_ms / 1000)
     last_kind = _github_url_kind(page.url)
 
     while time.monotonic() < deadline:
         if page.is_closed():
-            return "other"
+            return last_kind
 
-        last_kind = _github_url_kind(page.url)
+        try:
+            url = page.url
+        except Exception:
+            return last_kind
+
+        if url == "about:blank":
+            if time.monotonic() >= blank_deadline:
+                return "other"
+            await asyncio.sleep(0.2)
+            continue
+
+        last_kind = _github_url_kind(url)
+
         if last_kind in {"oauth_authorize", "oauth_flow", "challenge"}:
             return last_kind
+
         if last_kind != "password_login":
             return last_kind
 
         if await _looks_like_password_login(page):
             await asyncio.sleep(1.0)
-            last_kind = _github_url_kind(page.url)
-            if last_kind == "password_login" and await _looks_like_password_login(page):
+            if page.is_closed():
+                return "password_login"
+            if _github_url_kind(page.url) == "password_login" and await _looks_like_password_login(page):
                 return "password_login"
 
         await asyncio.sleep(0.3)
@@ -342,11 +483,10 @@ async def _github_gate_error(page, context, name: str) -> str | None:
 
 
 async def _provider_session(context) -> str | None:
-    try:
-        cookies = await context.cookies(PROVIDER_DOMAIN)
-    except Exception:
-        cookies = await context.cookies()
-    for cookie in cookies:
+    cookies = await _cookies_for(context, PROVIDER_DOMAIN, PROVIDER_HOST)
+    # Sort for determinism: an exact-host cookie and a parent-domain cookie can
+    # coexist, and flip-flopping between them would look like a new session.
+    for cookie in sorted(cookies, key=lambda c: str(c.get("domain") or "")):
         if cookie.get("name") == "session" and cookie.get("value"):
             return str(cookie["value"])
     return None
@@ -354,18 +494,19 @@ async def _provider_session(context) -> str | None:
 
 async def _clear_agentrouter_auth(context, page, name: str) -> None:
     """只清理 AgentRouter 登录态，保留 GitHub profile。"""
-    hostname = urlparse(PROVIDER_DOMAIN).hostname
+    hostname = PROVIDER_HOST
     if not hostname:
         raise RuntimeError(f"无法解析 AgentRouter 域名: {PROVIDER_DOMAIN}")
 
+    domains = [hostname, f".{hostname}"]
     failures = []
-    for domain in {hostname, f".{hostname}"}:
+    for domain in domains:
         try:
             await context.clear_cookies(domain=domain)
         except Exception as exc:
             failures.append(str(exc))
 
-    if len(failures) == 2:
+    if len(failures) == len(domains):
         raise RuntimeError(f"无法只清理 AgentRouter Cookie: {failures[0]}")
 
     try:
@@ -908,8 +1049,8 @@ def _balance(profile: dict | None) -> tuple[float, float] | None:
     if not isinstance(profile, dict):
         return None
     try:
-        quota = round(float(profile["quota"]) / 500000, 2)
-        used = round(float(profile["used_quota"]) / 500000, 2)
+        quota = round(float(profile["quota"]) / QUOTA_UNITS_PER_DOLLAR, 2)
+        used = round(float(profile["used_quota"]) / QUOTA_UNITS_PER_DOLLAR, 2)
     except (KeyError, TypeError, ValueError):
         return None
     return quota, used
@@ -1018,22 +1159,23 @@ async def check_in(name: str) -> dict:
         else:
             print(f"[{name}] [WARN] 未明确观察到 OAuth 回调页面")
 
-        callback_page = oauth_page if oauth_page is not None and not oauth_page.is_closed() else page
-        if new_session:
-            if await _wait_oauth_user_context(callback_page):
-                print(f"[{name}] [INFO] OAuth 用户上下文已就绪")
-            else:
-                print(f"[{name}] [WARN] OAuth 用户上下文未在预期时间内就绪")
-
-        user_profile = await _fetch_user_profile(page)
-        balance = _balance(user_profile)
-
+        # Bail out before the balance lookup: it costs up to ~40s of listening,
+        # retries and reloads, and the result is discarded on a failed run anyway.
         if not new_session:
             return {
                 "name": name,
                 "success": False,
                 "error": "未检测到新的 AgentRouter session，本次不能视为完成签到",
             }
+
+        callback_page = oauth_page if oauth_page is not None and not oauth_page.is_closed() else page
+        if await _wait_oauth_user_context(callback_page):
+            print(f"[{name}] [INFO] OAuth 用户上下文已就绪")
+        else:
+            print(f"[{name}] [WARN] OAuth 用户上下文未在预期时间内就绪")
+
+        user_profile = await _fetch_user_profile(page)
+        balance = _balance(user_profile)
 
         _write_marker(name, "valid")
 
@@ -1088,7 +1230,15 @@ async def check_in(name: str) -> dict:
 def list_profiles() -> int:
     names = set(_load_account_names())
     if PROFILE_ROOT.exists():
-        names.update(p.name for p in PROFILE_ROOT.iterdir() if p.is_dir())
+        # Directory contents are untrusted input too; skip anything that would
+        # not survive _validate_name rather than letting it reach _profile_dir.
+        for path in PROFILE_ROOT.iterdir():
+            if not path.is_dir():
+                continue
+            try:
+                names.add(_validate_name(path.name))
+            except ValueError:
+                print(f"⚠️  跳过非法 Profile 目录名: {path.name!r}")
 
     if not names:
         print("没有 AgentRouter GitHub Profile")
@@ -1177,14 +1327,23 @@ def print_usage() -> None:
 def main() -> int:
     args = sys.argv[1:]
 
-    if not args:
-        return asyncio.run(run_daily())
-    if args[0] == "add" and len(args) == 2:
-        return 0 if asyncio.run(add_profile(args[1])) else 1
-    if args[0] == "list" and len(args) == 1:
-        return list_profiles()
-    if args[0] == "delete" and len(args) == 2:
-        return delete_profile(args[1])
+    try:
+        if not args:
+            return asyncio.run(run_daily())
+        if args[0] == "add" and len(args) == 2:
+            return 0 if asyncio.run(add_profile(args[1])) else 1
+        if args[0] == "list" and len(args) == 1:
+            return list_profiles()
+        if args[0] == "delete" and len(args) == 2:
+            return delete_profile(args[1])
+    except ValueError as exc:
+        # Bad profile name or malformed AGENTROUTER_ACCOUNTS: a traceback here
+        # is noise, the message already says exactly what to fix.
+        print(f"[FAILED] 配置错误: {exc}")
+        return 2
+    except KeyboardInterrupt:
+        print("\n[ABORTED] 已中断")
+        return 130
 
     print_usage()
     return 2

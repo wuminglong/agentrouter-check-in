@@ -59,9 +59,11 @@ uv run python checkin.py list
 示例：
 
 ```text
-✅ account1: configured (.browser_profiles/agentrouter/account1)
-❌ account2: github-session-expired-advisory (.browser_profiles/agentrouter/account2)
+✅ account1: configured (/path/to/agentrouter-check-in/.browser_profiles/agentrouter/account1)
+❌ account2: github-session-expired-advisory (/path/to/agentrouter-check-in/.browser_profiles/agentrouter/account2)
 ```
+
+Profile 和余额记录的相对路径以脚本所在目录为准，与执行时的工作目录无关。
 
 `configured` 表示本地 Profile 已配置，不代表此命令实时访问 GitHub 验证会话。
 `github-session-expired-advisory` 只是上次运行的建议标记；每日签到会重新实时检查 cookie/OAuth，不会因为这个标记永久跳过。
