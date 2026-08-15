@@ -1,48 +1,27 @@
 # AgentRouter Check-in
 
-一个只做一件事的本地 AgentRouter 自动签到项目：
+AgentRouter 本地自动签到脚本。
 
-**保存 GitHub 浏览器登录态 → 每天重新走 GitHub OAuth → 触发 AgentRouter 签到 → 查询余额。**
-
-这个项目不包含：
-
-- GitHub Actions 定时任务
-- AnyRouter / 其他 Provider
-- 邮箱密码登录
-- Mihomo 订阅下载/节点筛选
-- 钉钉、Bark、Telegram 等通知
-- 原 fork 的旧签到逻辑
-- 云端保存 GitHub Cookie / Browser Profile
-
-## 为什么必须在本地运行
-
-AgentRouter 的签到实际发生在 GitHub OAuth 登录完成时。
-
-`.browser_profiles/` 保存的是 GitHub 浏览器登录态，因此应该始终留在自己的 Mac 上，不应上传到 GitHub Actions、Artifact、Cache 或仓库。
+通过持久化 GitHub 浏览器登录态，每次执行时重新完成 GitHub OAuth 登录，从而触发 AgentRouter 签到，并尝试读取签到后的账户余额。
 
 ## 环境要求
 
-- macOS
 - Python 3.11+
-- `uv`
-- 可以访问 GitHub 和 AgentRouter 的网络环境
+- [uv](https://docs.astral.sh/uv/)
+- 可正常访问 GitHub 和 AgentRouter
 
-安装 uv：
+## 安装
 
-```bash
-brew install uv
-```
-
-安装项目依赖：
+克隆项目并安装依赖：
 
 ```bash
+git clone https://github.com/wuminglong/agentrouter-check-in.git
+cd agentrouter-check-in
 uv sync
 uv run python -m cloakbrowser install
 ```
 
-> 项目目前固定 `cloakbrowser==0.3.31`，因为这是当前实测签到成功的版本。不要为了消除升级提示而直接升级，后续单独验证新版兼容性再调整。
-
-## 配置
+创建本地配置：
 
 ```bash
 cp .env.example .env
@@ -56,7 +35,7 @@ CHECKIN_PROXY_URL=http://127.0.0.1:7890
 CHECKIN_HEADLESS=true
 ```
 
-其中 `account1`、`account2` 只是本地 Profile 名称，可自行定义，不需要与 GitHub 用户名一致。
+`account1`、`account2` 是本地 Profile 名称，可自行定义。
 
 如果不需要代理：
 
@@ -64,86 +43,62 @@ CHECKIN_HEADLESS=true
 CHECKIN_PROXY_URL=
 ```
 
-## 首次添加账号
+## 添加账号
 
-第一个账号：
+首次使用时，需要为每个账号保存一次 GitHub 登录态：
 
 ```bash
 uv run python checkin.py add account1
 ```
 
-浏览器打开后登录对应的 GitHub 账号并完成可能的二次验证。
+浏览器打开后，完成对应 GitHub 账号的登录和验证。
 
-第二个账号：
+添加多个账号时分别执行：
 
 ```bash
+uv run python checkin.py add account1
 uv run python checkin.py add account2
 ```
 
-检查：
+查看已配置账号：
 
 ```bash
 uv run python checkin.py list
 ```
 
-正常应看到：
+示例：
 
 ```text
 ✅ account1: valid
 ✅ account2: valid
 ```
 
-## 每日签到
+## 执行签到
+
+执行所有已配置账号：
 
 ```bash
 uv run python checkin.py
 ```
 
-成功输出示例：
+示例输出：
 
 ```text
 [SYSTEM] AgentRouter GitHub OAuth 本地签到，账号数: 2
 [account1] [INFO] 已检测到新的 AgentRouter session
-[account1] [SUCCESS] 余额 $xx.xx，累计消耗 $xx.xx；本次签到 +$xx.xx
+[account1] [INFO] OAuth 回调已完成
+[account1] [SUCCESS] 余额 $12.34，累计消耗 $100.00；本次签到 +$1.00
 
 [account2] [INFO] 已检测到新的 AgentRouter session
-[account2] [SUCCESS] 余额 $xx.xx，累计消耗 $xx.xx；本次签到 +$xx.xx
+[account2] [INFO] OAuth 回调已完成
+[account2] [SUCCESS] 余额 $8.76，累计消耗 $50.00；本次总额度无新增（通常表示今天已经签到）
 
 [STATS] 成功 2/2
 ```
 
-如果今天已经签到过，余额不增加也是正常的：
+## 重新登录
 
-```text
-本次总额度无新增（通常表示今天已经签到）
-```
-
-## Codex Automation
-
-建议让本地 Codex 每天 09:00 在本项目目录执行：
-
-```bash
-uv run python checkin.py
-```
-
-Automation 规则建议：
-
-- 只执行签到，不修改代码
-- 不执行 git pull / push / commit
-- 使用现有 `.env`
-- 使用现有 `.browser_profiles`
-- `[STATS] 成功 N/N` 视为成功
-- OAuth 成功但当天无余额新增，不应视为失败
-
-## 账号重新登录
-
-如果出现：
-
-```text
-GitHub 登录态已失效
-```
-
-重新执行：
+如果 GitHub 登录态失效，重新执行：
 
 ```bash
 uv run python checkin.py add <name>
@@ -155,9 +110,9 @@ uv run python checkin.py add <name>
 uv run python checkin.py delete <name>
 ```
 
-## 安全
+## 本地文件
 
-以下文件均为本地敏感状态，已加入 `.gitignore`：
+以下文件包含本地配置或登录状态，已通过 `.gitignore` 排除：
 
 ```text
 .env
@@ -165,4 +120,4 @@ uv run python checkin.py delete <name>
 agentrouter_local_state.json
 ```
 
-尤其是 `.browser_profiles/`，其中包含 GitHub 登录态，**禁止提交、上传或分享**。
+请勿提交或分享 `.browser_profiles/`，其中包含浏览器登录状态。
