@@ -11,8 +11,8 @@
 - GitHub 登录态只保存在本机 .browser_profiles/
 - 每次签到前只清理 AgentRouter 登录态
 - 重新走 GitHub OAuth，触发 AgentRouter 每日签到
-- 新 AgentRouter session 是 OAuth 成功的重要证据
-- 余额查询失败不会把已经完成的 OAuth 签到误判为失败
+- 新 AgentRouter session 是签到成功的必要条件
+- 余额只用于展示和本地增量估算，不决定签到是否成功
 """
 
 from __future__ import annotations
@@ -39,24 +39,26 @@ CONSOLE_PATH = "/console"
 USER_SELF_PATH = "/api/user/self"
 
 GITHUB_PROFILE_URL = "https://github.com/settings/profile"
-GITHUB_LOGIN_PREFIX = "https://github.com/login"
 
 PROFILE_MARKER = ".agentrouter-github-profile.json"
 PROFILE_ROOT = Path(os.getenv("CHECKIN_BROWSER_PROFILE_DIR", ".browser_profiles")) / "agentrouter"
 STATE_FILE = Path(os.getenv("AGENTROUTER_LOCAL_STATE_FILE", "agentrouter_local_state.json"))
 
 WAIT_TIMEOUT_MS = int(os.getenv("CHECKIN_WAIT_TIMEOUT_MS", "120000"))
-HEADLESS = os.getenv("CHECKIN_HEADLESS", "true").strip().lower() in {"1", "true", "yes", "on"}
+HEADLESS = os.getenv("CHECKIN_HEADLESS", "false").strip().lower() in {"1", "true", "yes", "on"}
 HUMANIZE = os.getenv("CHECKIN_HUMANIZE", "true").strip().lower() in {"1", "true", "yes", "on"}
 PROXY_URL = os.getenv("CHECKIN_PROXY_URL", "").strip() or None
 DEBUG = os.getenv("DEBUG_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 GITHUB_LOGIN_SELECTORS = (
-    ".semi-card button:has(.semi-icon-github)",
-    '.semi-card button:has([aria-label*="github" i])',
+    # Prefer exact login CTA text first. Footer repo links also contain "github"
+    # and must never be treated as the OAuth entrypoint.
+    'button:has-text("使用 GitHub 继续")',
+    'button:has-text("GitHub")',
     "button:has(.semi-icon-github)",
+    '.semi-card button:has(.semi-icon-github)',
     'button:has([aria-label*="github" i])',
-    'a[href*="github" i]',
+    '.semi-card button:has([aria-label*="github" i])',
 )
 
 
@@ -204,12 +206,139 @@ async def _launch_context(name: str, *, headless: bool):
 
 
 async def _github_logged_in(context) -> bool:
+    """Return True only when a real GitHub session cookie is present.
+
+    `logged_in=yes` alone is treated as insufficient because it can linger after
+    a session is no longer accepted for OAuth.
+    """
     try:
         cookies = await context.cookies("https://github.com")
     except Exception:
         cookies = await context.cookies()
     by_name = {c.get("name"): c.get("value") for c in cookies}
-    return bool(by_name.get("user_session") or by_name.get("logged_in") == "yes")
+    user_session = by_name.get("user_session")
+    return bool(isinstance(user_session, str) and user_session.strip())
+
+
+def _github_url_kind(url: str) -> str:
+    """Classify a GitHub URL for OAuth/session troubleshooting."""
+    if not url or "github.com" not in url:
+        return "other"
+
+    lower = url.lower()
+    path = urlparse(url).path.lower()
+
+    if "github.com/login/oauth/authorize" in lower:
+        return "oauth_authorize"
+    if "github.com/login/oauth/" in lower:
+        return "oauth_flow"
+    if any(
+        token in lower
+        for token in (
+            "/sessions/two-factor",
+            "/sessions/verified-device",
+            "device_verification",
+            "/auth/verified-device",
+            "captcha",
+            "challenge",
+            "/sessions/unauthenticated",
+        )
+    ):
+        return "challenge"
+    if path.rstrip("/") == "/login":
+        return "password_login"
+    return "other"
+
+
+async def _looks_like_password_login(page) -> bool:
+    """Detect an actual username/password login form, not OAuth intermediate pages."""
+    if page is None or page.is_closed():
+        return False
+
+    kind = _github_url_kind(page.url)
+    if kind != "password_login":
+        return False
+
+    try:
+        login_field = page.locator('input[name="login"], #login_field')
+        password = page.locator('input[name="password"], #password')
+        if await login_field.count() > 0 and await password.count() > 0:
+            if await login_field.first.is_visible() and await password.first.is_visible():
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+async def _wait_github_auth_settled(page, timeout_ms: int = 15_000) -> str:
+    """Wait for GitHub redirects after OAuth entry, then return the settled kind."""
+    if page is None or page.is_closed():
+        return "other"
+
+    deadline = time.monotonic() + timeout_ms / 1000
+    last_kind = _github_url_kind(page.url)
+
+    while time.monotonic() < deadline:
+        if page.is_closed():
+            return "other"
+
+        last_kind = _github_url_kind(page.url)
+        if last_kind in {"oauth_authorize", "oauth_flow", "challenge"}:
+            return last_kind
+        if last_kind != "password_login":
+            return last_kind
+
+        if await _looks_like_password_login(page):
+            await asyncio.sleep(1.0)
+            last_kind = _github_url_kind(page.url)
+            if last_kind == "password_login" and await _looks_like_password_login(page):
+                return "password_login"
+
+        await asyncio.sleep(0.3)
+
+    return last_kind
+
+
+async def _github_gate_error(page, context, name: str) -> str | None:
+    """Return a precise GitHub gate error, or None when OAuth can continue.
+
+    Only persist marker status=expired when the session cookie is actually
+    missing. Challenge/risk pages must not permanently lock the profile.
+    """
+    if page is None or page.is_closed():
+        return None
+
+    kind = await _wait_github_auth_settled(page)
+    if kind in {"oauth_authorize", "oauth_flow"}:
+        await _confirm_oauth(page)
+        kind = await _wait_github_auth_settled(page, timeout_ms=8_000)
+
+    if kind in {"oauth_authorize", "oauth_flow"}:
+        return None
+
+    if kind not in {"password_login", "challenge"}:
+        return None
+
+    logged_in = await _github_logged_in(context)
+
+    if kind == "challenge":
+        return (
+            f"GitHub 需要人工验证/二次验证，请在 headed 浏览器中完成后再重试"
+            f"（可执行: uv run python checkin.py add {name}）"
+        )
+
+    if kind == "password_login":
+        if not logged_in:
+            _write_marker(name, "expired")
+            return f"GitHub 登录态已失效，请执行: uv run python checkin.py add {name}"
+
+        return (
+            f"GitHub 未接受当前浏览器会话（cookie 仍在，但 OAuth 落到登录页），"
+            f"请执行: uv run python checkin.py add {name} 刷新会话或完成验证"
+        )
+
+    return None
 
 
 async def _provider_session(context) -> str | None:
@@ -250,6 +379,18 @@ async def _clear_agentrouter_auth(context, page, name: str) -> None:
         )
     except Exception as exc:
         print(f"[WARN] {name}: storage 清理脚本安装失败: {exc}")
+
+    try:
+        current_host = urlparse(page.url).hostname
+        if current_host == hostname:
+            await page.evaluate(
+                """() => {
+                    localStorage.removeItem('user');
+                    sessionStorage.clear();
+                }"""
+            )
+    except Exception as exc:
+        print(f"[WARN] {name}: AgentRouter storage 清理失败: {exc}")
 
 
 async def _dismiss_popups(page) -> int:
@@ -326,9 +467,37 @@ async def _open_login_page(page, name: str) -> None:
 
 
 async def _click_github_login(page, timeout_ms: int = 30_000) -> bool:
+    """Compatibility wrapper: find+click only. Prefer _start_github_oauth_from_button."""
+    locator = await _find_github_login_locator(page, timeout_ms=timeout_ms)
+    if locator is None:
+        return False
+    try:
+        await locator.scroll_into_view_if_needed()
+        try:
+            await locator.click(timeout=5_000)
+        except Exception:
+            await locator.click(force=True, timeout=5_000)
+        return True
+    except Exception:
+        return False
+
+
+async def _find_github_login_locator(page, timeout_ms: int = 30_000):
+    """Return the best visible GitHub login CTA locator, or None."""
     deadline = time.monotonic() + timeout_ms / 1000
+    github_name = re.compile(r"(?:使用\s*)?GitHub", re.I)
+
     while time.monotonic() < deadline:
         await _dismiss_popups(page)
+
+        candidates = []
+
+        try:
+            role_button = page.get_by_role("button", name=github_name)
+            for i in range(await role_button.count()):
+                candidates.append(role_button.nth(i))
+        except Exception:
+            pass
 
         for selector in GITHUB_LOGIN_SELECTORS:
             locators = page.locator(selector)
@@ -336,32 +505,141 @@ async def _click_github_login(page, timeout_ms: int = 30_000) -> bool:
                 count = await locators.count()
             except Exception:
                 continue
-
             for i in range(count):
-                locator = locators.nth(i)
-                try:
-                    if not await locator.is_visible():
-                        continue
-                    await locator.scroll_into_view_if_needed()
-                    try:
-                        await locator.click(timeout=5_000)
-                    except Exception:
-                        await locator.click(force=True, timeout=5_000)
-                    return True
-                except Exception:
+                candidates.append(locators.nth(i))
+
+        for locator in candidates:
+            try:
+                if not await locator.is_visible():
                     continue
 
-        try:
-            button = page.get_by_role("button", name=re.compile(r"GitHub", re.I)).first
-            if await button.is_visible():
-                await button.click(timeout=5_000)
-                return True
-        except Exception:
-            pass
+                try:
+                    href = await locator.get_attribute("href")
+                except Exception:
+                    href = None
+                if href and "github.com/login/oauth" not in href and re.search(r"github\.com/(?!login)", href, re.I):
+                    continue
+
+                try:
+                    text = (await locator.inner_text()).strip()
+                except Exception:
+                    text = ""
+                if text and (not github_name.search(text)) and not href:
+                    aria = (await locator.get_attribute("aria-label") or "").strip()
+                    if not github_name.search(aria):
+                        continue
+
+                return locator
+            except Exception:
+                continue
 
         await asyncio.sleep(0.5)
 
-    return False
+    return None
+
+
+async def _wait_for_github_oauth_page(context, page, pages_before, timeout_ms: int = 15_000):
+    """Wait for GitHub OAuth to open via popup or same-tab navigation.
+
+    AgentRouter currently opens OAuth in a popup. That popup may already finish
+    and land back on AgentRouter before we inspect it, so completed provider
+    pages are also accepted.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    known = set(pages_before)
+
+    while time.monotonic() < deadline:
+        for candidate in context.pages:
+            if candidate in known or candidate.is_closed():
+                continue
+            try:
+                url = candidate.url
+            except Exception:
+                continue
+            if url == "about:blank":
+                settle_deadline = time.monotonic() + 5
+                while time.monotonic() < settle_deadline:
+                    if candidate.is_closed():
+                        break
+                    try:
+                        url = candidate.url
+                    except Exception:
+                        break
+                    if "github.com" in url or (
+                        PROVIDER_DOMAIN in url and "/login" not in url
+                    ):
+                        return candidate
+                    await asyncio.sleep(0.2)
+                continue
+
+            if "github.com" in url:
+                return candidate
+            if PROVIDER_DOMAIN in url and "/login" not in url:
+                return candidate
+
+        if page is not None and not page.is_closed() and "github.com" in page.url:
+            return page
+
+        await asyncio.sleep(0.2)
+
+    for candidate in context.pages:
+        if candidate.is_closed():
+            continue
+        try:
+            url = candidate.url
+            if "github.com" in url or (PROVIDER_DOMAIN in url and "/login" not in url and candidate not in known):
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+async def _start_github_oauth_from_button(context, page, timeout_ms: int = 20_000):
+    """Click the login CTA and wait for the resulting OAuth popup/page."""
+    locator = await _find_github_login_locator(page, timeout_ms=min(timeout_ms, 15_000))
+    if locator is None:
+        return False, None
+
+    pages_before = tuple(context.pages)
+    oauth_page = None
+
+    try:
+        await locator.scroll_into_view_if_needed()
+    except Exception:
+        pass
+
+    # Best path: wait for popup concurrently with the click.
+    try:
+        async with context.expect_page(timeout=timeout_ms) as page_info:
+            try:
+                await locator.click(timeout=5_000)
+            except Exception:
+                await locator.click(force=True, timeout=5_000)
+        oauth_page = await page_info.value
+    except Exception:
+        # Do not click again. The first click may already have opened OAuth.
+        pass
+
+    if oauth_page is None:
+        oauth_page = await _wait_for_github_oauth_page(
+            context,
+            page,
+            pages_before,
+            timeout_ms=timeout_ms,
+        )
+    elif oauth_page is not None:
+        # Popup exists; give about:blank a moment to navigate.
+        if not oauth_page.is_closed() and oauth_page.url == "about:blank":
+            settled = await _wait_for_github_oauth_page(
+                context,
+                page,
+                pages_before,
+                timeout_ms=5_000,
+            )
+            if settled is not None:
+                oauth_page = settled
+
+    return True, oauth_page
 
 
 async def _build_oauth_url(page) -> str | None:
@@ -459,11 +737,15 @@ async def _wait_oauth_user_context(page, timeout_ms: int = 10_000) -> bool:
 
 
 def _oauth_callback_completed(oauth_page, provider_page) -> bool:
-    if oauth_page is None:
-        return PROVIDER_DOMAIN in provider_page.url and "/login" not in provider_page.url
-    if oauth_page.is_closed():
-        return True
-    return PROVIDER_DOMAIN in oauth_page.url and "/login" not in oauth_page.url
+    pages = []
+    if oauth_page is not None and not oauth_page.is_closed():
+        pages.append(oauth_page)
+    if provider_page is not None and not provider_page.is_closed():
+        pages.append(provider_page)
+    return any(
+        PROVIDER_DOMAIN in page.url and "/login" not in page.url
+        for page in pages
+    )
 
 
 def _extract_user_profile(payload: object) -> dict | None:
@@ -604,11 +886,22 @@ async def _fetch_user_profile_direct(page) -> dict | None:
 
 async def _fetch_user_profile(page) -> dict | None:
     """先监听页面原生请求，再用浏览器主动请求兜底。"""
-    profile = await _capture_user_profile_from_console(page)
+    profile = await _capture_user_profile_from_console(page, timeout_ms=15_000)
     if profile:
         return profile
     print("[WARN] 未捕获页面原生 /api/user/self 响应，改用浏览器主动查询")
-    return await _fetch_user_profile_direct(page)
+    for attempt in range(1, 5):
+        profile = await _fetch_user_profile_direct(page)
+        if profile:
+            return profile
+        if attempt < 4:
+            print(f"[INFO] 余额查询重试 {attempt}/3")
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=30_000)
+            except Exception as exc:
+                print(f"[WARN] 余额查询页面刷新失败: {exc}")
+            await asyncio.sleep(1)
+    return None
 
 
 def _balance(profile: dict | None) -> tuple[float, float] | None:
@@ -625,14 +918,13 @@ def _balance(profile: dict | None) -> tuple[float, float] | None:
 async def add_profile(name: str) -> bool:
     name = _validate_name(name)
     profile = _profile_dir(name)
-
-    if profile.exists():
-        shutil.rmtree(profile)
+    existed = profile.exists()
 
     context = await _launch_context(name, headless=False)
     try:
         page = await context.new_page()
-        print(f"[SETUP] 创建 GitHub Profile: {profile}")
+        action = "更新" if existed else "创建"
+        print(f"[SETUP] {action} GitHub Profile: {profile}")
         print("[SETUP] 浏览器打开后，请完成 GitHub 登录和可能的二次验证。")
         await page.goto(GITHUB_PROFILE_URL, wait_until="domcontentloaded", timeout=60_000)
 
@@ -653,12 +945,17 @@ async def add_profile(name: str) -> bool:
 async def check_in(name: str) -> dict:
     name = _validate_name(name)
 
-    if _profile_status(name) != "valid":
+    status = _profile_status(name)
+    # "expired" is advisory only. Always re-verify live cookies/OAuth instead of
+    # hard-failing forever after one transient GitHub challenge.
+    if status not in {"valid", "expired"}:
         return {
             "name": name,
             "success": False,
             "error": f"Profile 未配置，请执行: uv run python checkin.py add {name}",
         }
+    if status == "expired":
+        print(f"[INFO] {name}: marker 为 expired，改为实时重新验证 GitHub 会话")
 
     context = await _launch_context(name, headless=HEADLESS)
     page = None
@@ -677,28 +974,22 @@ async def check_in(name: str) -> dict:
         await _open_login_page(page, name)
 
         previous_session = await _provider_session(context)
-        pages_before = tuple(context.pages)
-
-        clicked = await _click_github_login(page)
-        await asyncio.sleep(1)
-
-        new_pages = [p for p in context.pages if p not in pages_before]
-        oauth_page = new_pages[0] if new_pages else None
-
-        if oauth_page is None and "github.com/" in page.url:
-            oauth_page = page
+        clicked, oauth_page = await _start_github_oauth_from_button(context, page)
 
         if oauth_page is not None:
-            print(f"[{name}] 已进入 GitHub OAuth")
+            print(f"[{name}] 已通过登录按钮进入 GitHub OAuth")
             await _confirm_oauth(oauth_page)
 
         still_on_login = PROVIDER_DOMAIN in page.url and "/login" in page.url
-        if not clicked or (oauth_page is None and still_on_login):
+        if oauth_page is None and (not clicked or still_on_login):
             auth_url = await _build_oauth_url(page)
             if not auth_url:
                 auth_url = f"{PROVIDER_DOMAIN}/api/oauth/github"
 
-            print(f"[{name}] 登录按钮未完成跳转，使用 OAuth fallback")
+            if clicked:
+                print(f"[{name}] 登录按钮已点击，但未观察到 OAuth 页面，使用 OAuth fallback")
+            else:
+                print(f"[{name}] 未找到可用登录按钮，使用 OAuth fallback")
             await page.goto(auth_url, wait_until="domcontentloaded", timeout=60_000)
 
             if "github.com/" in page.url:
@@ -706,19 +997,15 @@ async def check_in(name: str) -> dict:
                 await _confirm_oauth(oauth_page)
 
         for candidate in (oauth_page, page):
-            if (
-                candidate is not None
-                and not candidate.is_closed()
-                and candidate.url.startswith(GITHUB_LOGIN_PREFIX)
-            ):
-                _write_marker(name, "expired")
+            gate_error = await _github_gate_error(candidate, context, name)
+            if gate_error:
                 return {
                     "name": name,
                     "success": False,
-                    "error": f"GitHub 要求重新登录，请执行: uv run python checkin.py add {name}",
+                    "error": gate_error,
                 }
 
-        new_session = await _wait_new_session(previous_session, context)
+        new_session = await _wait_new_session(previous_session, context, timeout_ms=WAIT_TIMEOUT_MS)
         callback_done = _oauth_callback_completed(oauth_page, page)
 
         if new_session:
@@ -731,7 +1018,6 @@ async def check_in(name: str) -> dict:
         else:
             print(f"[{name}] [WARN] 未明确观察到 OAuth 回调页面")
 
-        oauth_verified = new_session
         callback_page = oauth_page if oauth_page is not None and not oauth_page.is_closed() else page
         if new_session:
             if await _wait_oauth_user_context(callback_page):
@@ -742,11 +1028,11 @@ async def check_in(name: str) -> dict:
         user_profile = await _fetch_user_profile(page)
         balance = _balance(user_profile)
 
-        if not oauth_verified and balance is None:
+        if not new_session:
             return {
                 "name": name,
                 "success": False,
-                "error": "未检测到新的 AgentRouter session，且无法读取登录后的用户信息",
+                "error": "未检测到新的 AgentRouter session，本次不能视为完成签到",
             }
 
         _write_marker(name, "valid")
@@ -810,8 +1096,16 @@ def list_profiles() -> int:
 
     for name in sorted(names):
         status = _profile_status(name)
-        icon = "✅" if status == "valid" else "❌" if status == "expired" else "⚠️"
-        print(f"{icon} {name}: {status} ({_profile_dir(name)})")
+        if status == "valid":
+            label = "configured"
+            icon = "✅"
+        elif status == "expired":
+            label = "github-session-expired-advisory"
+            icon = "❌"
+        else:
+            label = status
+            icon = "⚠️"
+        print(f"{icon} {name}: {label} ({_profile_dir(name)})")
 
     return 0
 

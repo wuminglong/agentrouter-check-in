@@ -60,10 +60,11 @@ uv run python checkin.py list
 
 ```text
 ✅ account1: configured (.browser_profiles/agentrouter/account1)
-❌ account2: github-session-expired (.browser_profiles/agentrouter/account2)
+❌ account2: github-session-expired-advisory (.browser_profiles/agentrouter/account2)
 ```
 
 `configured` 表示本地 Profile 已配置，不代表此命令实时访问 GitHub 验证会话。
+`github-session-expired-advisory` 只是上次运行的建议标记；每日签到会重新实时检查 cookie/OAuth，不会因为这个标记永久跳过。
 
 ## 执行签到
 
@@ -85,6 +86,8 @@ uv run python checkin.py
 
 [STATS] 成功 2/2
 ```
+
+只有出现新的 AgentRouter session 才会记为签到成功。余额和奖励只用于展示，读不到余额不会把已经完成的 OAuth 签到改判失败。
 
 ## 删除账号
 
