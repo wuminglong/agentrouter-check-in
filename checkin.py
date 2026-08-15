@@ -13,4 +13,9 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 os.chdir(BASE_DIR)
+
+# GitHub OAuth session stability is much better when the browser mode stays
+# consistent with the interactive `add` flow. Keep daily runs headed as well.
+os.environ["CHECKIN_HEADLESS"] = "false"
+
 runpy.run_path(str(BASE_DIR / "checkin_core.py"), run_name="__main__")
