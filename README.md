@@ -51,10 +51,12 @@ cp .env.example .env
 编辑 `.env`：
 
 ```dotenv
-AGENTROUTER_ACCOUNTS=["wml","jyq"]
+AGENTROUTER_ACCOUNTS=["account1","account2"]
 CHECKIN_PROXY_URL=http://127.0.0.1:7890
 CHECKIN_HEADLESS=true
 ```
+
+其中 `account1`、`account2` 只是本地 Profile 名称，可自行定义，不需要与 GitHub 用户名一致。
 
 如果不需要代理：
 
@@ -67,7 +69,7 @@ CHECKIN_PROXY_URL=
 第一个账号：
 
 ```bash
-uv run python checkin.py add wml
+uv run python checkin.py add account1
 ```
 
 浏览器打开后登录对应的 GitHub 账号并完成可能的二次验证。
@@ -75,7 +77,7 @@ uv run python checkin.py add wml
 第二个账号：
 
 ```bash
-uv run python checkin.py add jyq
+uv run python checkin.py add account2
 ```
 
 检查：
@@ -87,8 +89,8 @@ uv run python checkin.py list
 正常应看到：
 
 ```text
-✅ jyq: valid
-✅ wml: valid
+✅ account1: valid
+✅ account2: valid
 ```
 
 ## 每日签到
@@ -101,11 +103,11 @@ uv run python checkin.py
 
 ```text
 [SYSTEM] AgentRouter GitHub OAuth 本地签到，账号数: 2
-[wml] [INFO] 已检测到新的 AgentRouter session
-[wml] [SUCCESS] 余额 $xx.xx，累计消耗 $xx.xx；本次签到 +$xx.xx
+[account1] [INFO] 已检测到新的 AgentRouter session
+[account1] [SUCCESS] 余额 $xx.xx，累计消耗 $xx.xx；本次签到 +$xx.xx
 
-[jyq] [INFO] 已检测到新的 AgentRouter session
-[jyq] [SUCCESS] 余额 $xx.xx，累计消耗 $xx.xx；本次签到 +$xx.xx
+[account2] [INFO] 已检测到新的 AgentRouter session
+[account2] [SUCCESS] 余额 $xx.xx，累计消耗 $xx.xx；本次签到 +$xx.xx
 
 [STATS] 成功 2/2
 ```
