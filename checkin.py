@@ -409,19 +409,72 @@ def _oauth_callback_completed(oauth_page, provider_page) -> bool:
     return PROVIDER_DOMAIN in oauth_page.url and "/login" not in oauth_page.url
 
 
-async def _fetch_user_profile(page) -> dict | None:
-    """使用已登录浏览器直接查询 /api/user/self，避免 SPA 响应监听漏掉。"""
+def _extract_user_profile(payload: object) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+
+    data = payload.get("data")
+    if payload.get("success") is True and isinstance(data, dict) and data.get("id"):
+        return data
+    if payload.get("id"):
+        return payload
+    return None
+
+
+async def _capture_user_profile_from_console(page, timeout_ms: int = 15_000) -> dict | None:
+    """监听 AgentRouter 页面自身的 /api/user/self 响应。
+
+    这是优先路径，因为页面自己的请求会带上 AgentRouter 前端运行时准备的用户上下文。
+    """
+    captured: dict | None = None
+    captured_event = asyncio.Event()
+
+    async def on_response(response) -> None:
+        nonlocal captured
+        if captured is not None:
+            return
+        if USER_SELF_PATH not in response.url or response.status != 200:
+            return
+        try:
+            payload = await response.json()
+        except Exception:
+            return
+        profile = _extract_user_profile(payload)
+        if profile:
+            captured = profile
+            captured_event.set()
+
+    page.on("response", on_response)
     try:
-        await page.goto(
-            f"{PROVIDER_DOMAIN}{CONSOLE_PATH}",
-            wait_until="domcontentloaded",
-            timeout=60_000,
-        )
-    except Exception:
-        pass
+        try:
+            await page.goto(
+                f"{PROVIDER_DOMAIN}{CONSOLE_PATH}",
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+        except Exception:
+            pass
 
-    await asyncio.sleep(2)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            pass
 
+        if captured is None:
+            try:
+                await asyncio.wait_for(captured_event.wait(), timeout=timeout_ms / 1000)
+            except TimeoutError:
+                pass
+
+        if captured is not None:
+            print("[INFO] 已监听页面原生 /api/user/self 响应并读取余额")
+        return captured
+    finally:
+        page.remove_listener("response", on_response)
+
+
+async def _fetch_user_profile_direct(page) -> dict | None:
+    """原生监听未命中时，在已登录浏览器上下文中主动查询 /api/user/self。"""
     try:
         result = await page.evaluate(
             """async () => {
@@ -446,32 +499,45 @@ async def _fetch_user_profile(page) -> dict | None:
                     return {
                         status: response.status,
                         text: await response.text(),
+                        userId,
                     };
                 } catch (error) {
-                    return {status: 0, text: String(error)};
+                    return {status: 0, text: String(error), userId: null};
                 }
             }"""
         )
-    except Exception:
+    except Exception as exc:
+        if DEBUG:
+            print(f"[DEBUG] 主动余额查询执行失败: {exc}")
         return None
 
-    if not isinstance(result, dict) or result.get("status") != 200:
+    if not isinstance(result, dict):
+        return None
+
+    status = result.get("status")
+    if status != 200:
+        print(f"[WARN] 主动 /api/user/self 查询失败: HTTP {status}, user_id={result.get('userId')}")
         return None
 
     try:
         payload = json.loads(str(result.get("text") or ""))
     except json.JSONDecodeError:
+        print("[WARN] 主动 /api/user/self 返回了非 JSON 内容")
         return None
 
-    if not isinstance(payload, dict):
-        return None
+    profile = _extract_user_profile(payload)
+    if profile:
+        print("[INFO] 已通过浏览器主动请求 /api/user/self 读取余额")
+    return profile
 
-    data = payload.get("data")
-    if payload.get("success") is True and isinstance(data, dict) and data.get("id"):
-        return data
-    if payload.get("id"):
-        return payload
-    return None
+
+async def _fetch_user_profile(page) -> dict | None:
+    """先监听页面原生请求，再用浏览器主动请求兜底。"""
+    profile = await _capture_user_profile_from_console(page)
+    if profile:
+        return profile
+    print("[WARN] 未捕获页面原生 /api/user/self 响应，改用浏览器主动查询")
+    return await _fetch_user_profile_direct(page)
 
 
 def _balance(profile: dict | None) -> tuple[float, float] | None:
@@ -594,8 +660,6 @@ async def check_in(name: str) -> dict:
         else:
             print(f"[{name}] [WARN] 未明确观察到 OAuth 回调页面")
 
-        # 清理过 AgentRouter auth 后重新出现 session，是非常强的 OAuth 成功证据。
-        # 余额接口是附加验证，不再是唯一成功条件。
         oauth_verified = new_session
 
         user_profile = await _fetch_user_profile(page)
@@ -701,7 +765,6 @@ async def run_daily() -> int:
     print(f"[SYSTEM] AgentRouter GitHub OAuth 本地签到，账号数: {len(names)}")
     results = []
 
-    # 串行执行，降低同一 IP 下 OAuth / WAF 抖动。
     for name in names:
         result = await check_in(name)
         results.append(result)
